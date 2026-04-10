@@ -1,0 +1,599 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <HTTPClient.h>   // --- PIR & ThingSpeak ---
+
+// Replace with your network credentials
+const char* ssid     = "vivo";
+const char* password = "anees316316";
+
+// --- PIR & ThingSpeak ---
+const int pirPin = 34;  // PIR Sensor output pin
+const char* apiKey = "YOUR_THINGSPEAK_WRITE_API_KEY";  // Replace with your ThingSpeak Write API key
+const char* serverName = "http://api.thingspeak.com/update";
+
+// Create an instance of the WebServer on port 80
+WebServer server(80);
+
+// Motor 1
+int motor1Pin1 = 27; 
+int motor1Pin2 = 26; 
+int enable1Pin = 14;
+
+// Motor 2
+int motor2Pin1 = 33; 
+int motor2Pin2 = 25;
+int enable2Pin = 32;
+
+// LED Pins (simulate UV-C light)
+int led1 = 13;
+int led2 = 12;
+int led3 = 15;
+int led4 = 2;
+
+// PWM properties
+const int freq = 30000;
+const int resolution = 8;
+int dutyCycle = 0;
+
+// --- Novelty parameters ---
+float disinfectWidth = 0.28;  // meters
+float speedMPerS = 0.01;      // meters per second
+float totalAreaCovered = 0;   // in m²
+float totalArea = 10.0;       // total room area in m²
+unsigned long moveStartTime = 0;
+bool moving = false;
+
+unsigned long ledOnStartTime = 0;
+unsigned long ledOnDuration = 0;
+bool ledOn = false;
+
+// Other variables
+String valueString = String(0);
+bool stopFlag = false;  // Flag for STOP button
+
+// ------------------- Web Dashboard -------------------
+void handleRoot() {
+  const char html[] PROGMEM = R"rawliteral(
+  <!DOCTYPE HTML><html>
+  <head>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <link rel="icon" href="data:,">
+    <style>
+      html { font-family: Helvetica; display: inline-block; margin: 0px auto; text-align: center; }
+      .button { -webkit-user-select: none; -moz-user-select: none; -ms-user-select: none; user-select: none; background-color: #4CAF50; border: none; color: white; padding: 12px 28px; text-decoration: none; font-size: 26px; margin: 1px; cursor: pointer; }
+      .button2 {background-color: #555555;}
+    </style>
+    <script>
+      function moveForward() { fetch('/forward'); }
+      function moveLeft() { fetch('/left'); }
+      function stopRobot() { fetch('/stop'); }
+      function moveRight() { fetch('/right'); }
+      function moveReverse() { fetch('/reverse'); }
+
+      function updateMotorSpeed(pos) {
+        document.getElementById('motorSpeed').innerHTML = pos;
+        fetch('/speed?value=' + pos);
+      }
+    </script>
+  </head>
+  <body>
+    <h1>ESP32 Motor Control</h1>
+    <p><button class="button" onclick="moveForward()">FORWARD</button></p>
+    <div style="clear: both;">
+      <p>
+        <button class="button" onclick="moveLeft()">LEFT</button>
+        <button class="button button2" onclick="stopRobot()">STOP</button>
+        <button class="button" onclick="moveRight()">RIGHT</button>
+      </p>
+    </div>
+    <p><button class="button" onclick="moveReverse()">REVERSE</button></p>
+    <p>Motor Speed: <span id="motorSpeed">0</span></p>
+    <input type="range" min="0" max="100" step="25" id="motorSlider" oninput="updateMotorSpeed(this.value)" value="0"/>
+  </body>
+  </html>)rawliteral";
+  server.send(200, "text/html", html);
+}
+
+// ------------------- Motor Handlers -------------------
+void handleForward() {
+  if (!moving) moveStartTime = millis();
+  moving = true;
+
+  digitalWrite(motor1Pin1, LOW);
+  digitalWrite(motor1Pin2, HIGH); 
+  digitalWrite(motor2Pin1, LOW);
+  digitalWrite(motor2Pin2, HIGH);
+  stopFlag = false;
+  updateLEDs(stopFlag, digitalRead(pirPin));
+  server.send(200);
+}
+
+void handleLeft() {
+  if (!moving) moveStartTime = millis();
+  moving = true;
+
+  digitalWrite(motor1Pin1, LOW); 
+  digitalWrite(motor1Pin2, LOW); 
+  digitalWrite(motor2Pin1, LOW);
+  digitalWrite(motor2Pin2, HIGH);
+  stopFlag = false;
+  updateLEDs(stopFlag, digitalRead(pirPin));
+  server.send(200);
+}
+
+void handleStop() {
+  if (moving) {
+    unsigned long moveEndTime = millis();
+    float durationSec = (moveEndTime - moveStartTime) / 1000.0;
+    totalAreaCovered += speedMPerS * disinfectWidth * durationSec;
+    moving = false;
+  }
+  digitalWrite(motor1Pin1, LOW); 
+  digitalWrite(motor1Pin2, LOW); 
+  digitalWrite(motor2Pin1, LOW);
+  digitalWrite(motor2Pin2, LOW);   
+  stopFlag = true;
+  updateLEDs(stopFlag, digitalRead(pirPin));
+  server.send(200);
+}
+
+void handleRight() {
+  if (!moving) moveStartTime = millis();
+  moving = true;
+
+  digitalWrite(motor1Pin1, LOW); 
+  digitalWrite(motor1Pin2, HIGH); 
+  digitalWrite(motor2Pin1, LOW);
+  digitalWrite(motor2Pin2, LOW);    
+  stopFlag = false;
+  updateLEDs(stopFlag, digitalRead(pirPin));
+  server.send(200);
+}
+
+void handleReverse() {
+  if (!moving) moveStartTime = millis();
+  moving = true;
+
+  digitalWrite(motor1Pin1, HIGH);
+  digitalWrite(motor1Pin2, LOW); 
+  digitalWrite(motor2Pin1, HIGH);
+  digitalWrite(motor2Pin2, LOW);          
+  stopFlag = false;
+  updateLEDs(stopFlag, digitalRead(pirPin));
+  server.send(200);
+}
+
+// ------------------- Motor Speed -------------------
+void handleSpeed() {
+  if (server.hasArg("value")) {
+    valueString = server.arg("value");
+    int value = valueString.toInt();
+    if (value == 0) {
+      ledcWrite(enable1Pin, 0);
+      ledcWrite(enable2Pin, 0);
+      digitalWrite(motor1Pin1, LOW); 
+      digitalWrite(motor1Pin2, LOW); 
+      digitalWrite(motor2Pin1, LOW);
+      digitalWrite(motor2Pin2, LOW);   
+    } else { 
+      dutyCycle = map(value, 25, 100, 200, 255);
+      ledcWrite(enable1Pin, dutyCycle);
+      ledcWrite(enable2Pin, dutyCycle);
+      Serial.println("Motor speed set to " + String(value));
+    }
+  }
+  server.send(200);
+}
+
+// ------------------- LED Update -------------------
+void updateLEDs(bool stopPressed, bool motionDetected) {
+  bool newLedOn = !stopPressed && !motionDetected;
+  if (newLedOn && !ledOn) {
+    ledOnStartTime = millis(); // LED just turned ON
+  } 
+  if (!newLedOn && ledOn) {
+    ledOnDuration += millis() - ledOnStartTime; // add ON duration
+  }
+  ledOn = newLedOn;
+
+  digitalWrite(led1, ledOn ? HIGH : LOW);
+  digitalWrite(led2, ledOn ? HIGH : LOW);
+  digitalWrite(led3, ledOn ? HIGH : LOW);
+  digitalWrite(led4, ledOn ? HIGH : LOW);
+}
+
+// ------------------- Setup -------------------
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(motor1Pin1, OUTPUT);
+  pinMode(motor1Pin2, OUTPUT);
+  pinMode(motor2Pin1, OUTPUT);
+  pinMode(motor2Pin2, OUTPUT);
+
+  pinMode(pirPin, INPUT);
+
+  pinMode(led1, OUTPUT);
+  pinMode(led2, OUTPUT);
+  pinMode(led3, OUTPUT);
+  pinMode(led4, OUTPUT);
+  digitalWrite(led1, HIGH);
+  digitalWrite(led2, HIGH);
+  digitalWrite(led3, HIGH);
+  digitalWrite(led4, HIGH);
+
+  ledcAttach(enable1Pin, freq, resolution);
+  ledcAttach(enable2Pin, freq, resolution);
+    
+  ledcWrite(enable1Pin, 0);
+  ledcWrite(enable2Pin, 0);
+  
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("");
+  Serial.println("WiFi connected.");
+  Serial.println("IP address: ");
+  Serial.println(WiFi.localIP());
+
+  server.on("/", handleRoot);
+  server.on("/forward", handleForward);
+  server.on("/left", handleLeft);
+  server.on("/stop", handleStop);
+  server.on("/right", handleRight);
+  server.on("/reverse", handleReverse);
+  server.on("/speed", handleSpeed);
+
+  server.begin();
+}
+
+// ------------------- Loop -------------------
+void loop() {
+  server.handleClient();
+
+  static unsigned long lastUpdate = 0;
+  int motion = digitalRead(pirPin);
+
+  updateLEDs(stopFlag, motion);
+
+  if (millis() - lastUpdate > 20000) {  // update every 20 sec
+    lastUpdate = millis();
+    if (WiFi.status() == WL_CONNECTED) {
+      HTTPClient http;
+
+      unsigned long totalLedOnTime = ledOnDuration;
+      if (ledOn) {
+        totalLedOnTime += millis() - ledOnStartTime;
+      }
+
+      float areaCovered_ft = totalAreaCovered * 10.7639;
+      float totalArea_ft = totalArea * 10.7639;
+      float disinfectPercent = (totalAreaCovered / totalArea) * 100;
+      if (disinfectPercent > 100) disinfectPercent = 100;
+
+      String url = String(serverName) + "?api_key=" + apiKey 
+                   + "&field1=" + String(motion)
+                   + "&field2=" + String(areaCovered_ft)    // Area in sq ft
+                   + "&field3=" + String(disinfectPercent)
+                   + "&field4=" + String(totalLedOnTime / 1000.0); // LED ON time in sec
+
+      http.begin(url);
+      int httpCode = http.GET();
+      if (httpCode > 0) {
+        Serial.println("ThingSpeak update: " + String(httpCode));
+      } else {
+        Serial.println("Failed to connect to ThingSpeak");
+      }
+      http.end();
+    }
+
+    Serial.print("PIR Status: ");
+    Serial.println(motion == HIGH ? "Motion Detected" : "No Motion");
+    Serial.print("Area Covered (ft²): ");
+    Serial.println(totalAreaCovered * 10.7639);
+    Serial.print("Disinfect %: ");
+    Serial.println((totalAreaCovered / totalArea) * 100);
+  }
+}
+ABINAYA S, Oct 23, 3:24 PM
+#include <WiFi.h>
+#include <WebServer.h>
+#include <HTTPClient.h>   // --- PIR & ThingSpeak ---
+
+// Replace with your network credentials
+const char* ssid     = "vivo";
+const char* password = "anees316316";
+
+// --- PIR & ThingSpeak ---
+const int pirPin = 34;  // PIR Sensor output pin
+const char* apiKey = "YOUR_THINGSPEAK_WRITE_API_KEY";  // Replace with your ThingSpeak Write API key
+const char* serverName = "http://api.thingspeak.com/update";
+
+// Create an instance of the WebServer on port 80
+WebServer server(80);
+
+// Motor 1
+int motor1Pin1 = 27; 
+int motor1Pin2 = 26; 
+int enable1Pin = 14;
+
+// Motor 2
+int motor2Pin1 = 33; 
+int motor2Pin2 = 25;
+int enable2Pin = 32;
+
+// LED Pins (simulate UV-C light)
+int led1 = 13;
+int led2 = 12;
+int led3 = 15;
+int led4 = 2;
+
+// PWM properties
+const int freq = 30000;
+const int resolution = 8;
+int dutyCycle = 0;
+
+// --- Novelty parameters ---
+float disinfectWidth = 0.28;  // meters
+float speedMPerS = 0.01;      // meters per second
+float totalAreaCovered = 0;   // in m²
+float totalArea = 10.0;       // total room area in m²
+unsigned long moveStartTime = 0;
+bool moving = false;
+
+unsigned long ledOnStartTime = 0;
+unsigned long ledOnDuration = 0;
+bool ledOn = false;
+
+// Other variables
+String valueString = String(0);
+bool stopFlag = false;  // Flag for STOP button
+
+// ------------------- Web Dashboard -------------------
+void handleRoot() {
+  const char html[] PROGMEM = R"rawliteral(
+  <!DOCTYPE HTML><html>
+  <head>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <link rel="icon" href="data:,">
+    <style>
+      html { font-family: Helvetica; display: inline-block; margin: 0px auto; text-align: center; }
+      .button { -webkit-user-select: none; -moz-user-select: none; -ms-user-select: none; user-select: none; background-color: #4CAF50; border: none; color: white; padding: 12px 28px; text-decoration: none; font-size: 26px; margin: 1px; cursor: pointer; }
+      .button2 {background-color: #555555;}
+    </style>
+    <script>
+      function moveForward() { fetch('/forward'); }
+      function moveLeft() { fetch('/left'); }
+      function stopRobot() { fetch('/stop'); }
+      function moveRight() { fetch('/right'); }
+      function moveReverse() { fetch('/reverse'); }
+
+      function updateMotorSpeed(pos) {
+        document.getElementById('motorSpeed').innerHTML = pos;
+        fetch('/speed?value=' + pos);
+      }
+    </script>
+  </head>
+  <body>
+    <h1>ESP32 Motor Control</h1>
+    <p><button class="button" onclick="moveForward()">FORWARD</button></p>
+    <div style="clear: both;">
+      <p>
+        <button class="button" onclick="moveLeft()">LEFT</button>
+        <button class="button button2" onclick="stopRobot()">STOP</button>
+        <button class="button" onclick="moveRight()">RIGHT</button>
+      </p>
+    </div>
+    <p><button class="button" onclick="moveReverse()">REVERSE</button></p>
+    <p>Motor Speed: <span id="motorSpeed">0</span></p>
+    <input type="range" min="0" max="100" step="25" id="motorSlider" oninput="updateMotorSpeed(this.value)" value="0"/>
+  </body>
+  </html>)rawliteral";
+  server.send(200, "text/html", html);
+}
+
+// ------------------- Motor Handlers -------------------
+void handleForward() {
+  if (!moving) moveStartTime = millis();
+  moving = true;
+
+  digitalWrite(motor1Pin1, LOW);
+  digitalWrite(motor1Pin2, HIGH); 
+  digitalWrite(motor2Pin1, LOW);
+  digitalWrite(motor2Pin2, HIGH);
+  stopFlag = false;
+  updateLEDs(stopFlag, digitalRead(pirPin));
+  server.send(200);
+}
+
+void handleLeft() {
+  if (!moving) moveStartTime = millis();
+  moving = true;
+
+  digitalWrite(motor1Pin1, LOW); 
+  digitalWrite(motor1Pin2, LOW); 
+  digitalWrite(motor2Pin1, LOW);
+  digitalWrite(motor2Pin2, HIGH);
+  stopFlag = false;
+  updateLEDs(stopFlag, digitalRead(pirPin));
+  server.send(200);
+}
+
+void handleStop() {
+  if (moving) {
+    unsigned long moveEndTime = millis();
+    float durationSec = (moveEndTime - moveStartTime) / 1000.0;
+    totalAreaCovered += speedMPerS * disinfectWidth * durationSec;
+    moving = false;
+  }
+  digitalWrite(motor1Pin1, LOW); 
+  digitalWrite(motor1Pin2, LOW); 
+  digitalWrite(motor2Pin1, LOW);
+  digitalWrite(motor2Pin2, LOW);   
+  stopFlag = true;
+  updateLEDs(stopFlag, digitalRead(pirPin));
+  server.send(200);
+}
+
+void handleRight() {
+  if (!moving) moveStartTime = millis();
+  moving = true;
+
+  digitalWrite(motor1Pin1, LOW); 
+  digitalWrite(motor1Pin2, HIGH); 
+  digitalWrite(motor2Pin1, LOW);
+  digitalWrite(motor2Pin2, LOW);    
+  stopFlag = false;
+  updateLEDs(stopFlag, digitalRead(pirPin));
+  server.send(200);
+}
+
+void handleReverse() {
+  if (!moving) moveStartTime = millis();
+  moving = true;
+
+  digitalWrite(motor1Pin1, HIGH);
+  digitalWrite(motor1Pin2, LOW); 
+  digitalWrite(motor2Pin1, HIGH);
+  digitalWrite(motor2Pin2, LOW);          
+  stopFlag = false;
+  updateLEDs(stopFlag, digitalRead(pirPin));
+  server.send(200);
+}
+
+// ------------------- Motor Speed -------------------
+void handleSpeed() {
+  if (server.hasArg("value")) {
+    valueString = server.arg("value");
+    int value = valueString.toInt();
+    if (value == 0) {
+      ledcWrite(enable1Pin, 0);
+      ledcWrite(enable2Pin, 0);
+      digitalWrite(motor1Pin1, LOW); 
+      digitalWrite(motor1Pin2, LOW); 
+      digitalWrite(motor2Pin1, LOW);
+      digitalWrite(motor2Pin2, LOW);   
+    } else { 
+      dutyCycle = map(value, 25, 100, 200, 255);
+      ledcWrite(enable1Pin, dutyCycle);
+      ledcWrite(enable2Pin, dutyCycle);
+      Serial.println("Motor speed set to " + String(value));
+    }
+  }
+  server.send(200);
+}
+
+// ------------------- LED Update -------------------
+void updateLEDs(bool stopPressed, bool motionDetected) {
+  bool newLedOn = !stopPressed && !motionDetected;
+  if (newLedOn && !ledOn) {
+    ledOnStartTime = millis(); // LED just turned ON
+  } 
+  if (!newLedOn && ledOn) {
+    ledOnDuration += millis() - ledOnStartTime; // add ON duration
+  }
+  ledOn = newLedOn;
+
+  digitalWrite(led1, ledOn ? HIGH : LOW);
+  digitalWrite(led2, ledOn ? HIGH : LOW);
+  digitalWrite(led3, ledOn ? HIGH : LOW);
+  digitalWrite(led4, ledOn ? HIGH : LOW);
+}
+
+// ------------------- Setup -------------------
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(motor1Pin1, OUTPUT);
+  pinMode(motor1Pin2, OUTPUT);
+  pinMode(motor2Pin1, OUTPUT);
+  pinMode(motor2Pin2, OUTPUT);
+
+  pinMode(pirPin, INPUT);
+
+  pinMode(led1, OUTPUT);
+  pinMode(led2, OUTPUT);
+  pinMode(led3, OUTPUT);
+  pinMode(led4, OUTPUT);
+  digitalWrite(led1, HIGH);
+  digitalWrite(led2, HIGH);
+  digitalWrite(led3, HIGH);
+  digitalWrite(led4, HIGH);
+
+  ledcAttach(enable1Pin, freq, resolution);
+  ledcAttach(enable2Pin, freq, resolution);
+    
+  ledcWrite(enable1Pin, 0);
+  ledcWrite(enable2Pin, 0);
+  
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("");
+  Serial.println("WiFi connected.");
+  Serial.println("IP address: ");
+  Serial.println(WiFi.localIP());
+
+  server.on("/", handleRoot);
+  server.on("/forward", handleForward);
+  server.on("/left", handleLeft);
+  server.on("/stop", handleStop);
+  server.on("/right", handleRight);
+  server.on("/reverse", handleReverse);
+  server.on("/speed", handleSpeed);
+
+  server.begin();
+}
+
+// ------------------- Loop -------------------
+void loop() {
+  server.handleClient();
+
+  static unsigned long lastUpdate = 0;
+  int motion = digitalRead(pirPin);
+
+  updateLEDs(stopFlag, motion);
+
+  if (millis() - lastUpdate > 5000) {  // update every 5 sec
+    lastUpdate = millis();
+    if (WiFi.status() == WL_CONNECTED) {
+      HTTPClient http;
+
+      unsigned long totalLedOnTime = ledOnDuration;
+      if (ledOn) {
+        totalLedOnTime += millis() - ledOnStartTime;
+      }
+
+      float areaCovered_ft = totalAreaCovered * 10.7639;
+      float totalArea_ft = totalArea * 10.7639;
+      float disinfectPercent = (totalAreaCovered / totalArea) * 100;
+      if (disinfectPercent > 100) disinfectPercent = 100;
+
+      String url = String(serverName) + "?api_key=" + apiKey 
+                   + "&field1=" + String(motion)
+                   + "&field2=" + String(areaCovered_ft)    // Area in sq ft
+                   + "&field3=" + String(disinfectPercent)
+                   + "&field4=" + String(totalLedOnTime / 1000.0); // LED ON time in sec
+
+      http.begin(url);
+      int httpCode = http.GET();
+      if (httpCode > 0) {
+        Serial.println("ThingSpeak update: " + String(httpCode));
+      } else {
+        Serial.println("Failed to connect to ThingSpeak");
+      }
+      http.end();
+    }
+
+    Serial.print("PIR Status: ");
+    Serial.println(motion == HIGH ? "Motion Detected" : "No Motion");
+    Serial.print("Area Covered (ft²): ");
+    Serial.println(totalAreaCovered * 10.7639);
+    Serial.print("Disinfect %: ");
+    Serial.println((totalAreaCovered / totalArea) * 100);
+  }
+}
